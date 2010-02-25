@@ -35,7 +35,7 @@ main(["erl_src", Src]) ->
                              CompileOptions])},
     print_summary([build(Target, Options)]);
 main(_) ->
-    io:format("usage: ~s~n", [script_name()]),
+    io:format("usage: ~s [clean | all | erl_src <file>]~n", [script_name()]),
     halt(1).
 
 make() ->
