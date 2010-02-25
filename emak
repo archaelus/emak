@@ -1,0 +1,491 @@
+#!/usr/bin/env escript
+%% -*- erlang -*-
+
+%% Fullness of time:
+%% * export_all <module>
+%%
+%% Assumptions:
+%%  * Projects have a src/ dir
+%%    * Beams go in ../ebin relative to the source file
+%%    * Hierarchial modules can go to hell
+%%    * the project include dir is ../include relative to the src file
+%%    * <Proj>/{src,ebin,include,priv}
+%%    * src/*.app are the application files we should fill out the module list in and place in ebin/
+%%  * We should invoke make all if c_src exists, make clean on emak clean.
+
+main([]) ->
+    make();
+main(["clean"]) ->
+    clean();
+main(["what"]) ->
+    format("Targets: ~p", [targets(options())]),
+    timer:sleep(100),
+    halt(0);
+main(["erl_src", Src]) ->
+    filename:extension(Src) =:= ".erl",
+    {Module, _File} = module_to_build(Src),
+    Options = options(),
+    CompileOptions = compile_options(Options),
+    EbinDir = ebin_dir_for(filename:dirname(Src)),
+    Target = {module, Module, beam(Module, EbinDir), Src,
+              lists:append([ [{outdir, EbinDir}],
+                             [{i, IDir} || IDir <- erl_include_path(Src, Options)],
+                             CompileOptions])},
+    print_summary([build(Target, Options)]);
+main(_) ->
+    io:format("usage: ~s~n", [script_name()]),
+    halt(1).
+
+make() ->
+    Options = options(),
+    Targets = targets(Options),
+    Result = [build(Target, Options) || Target <- Targets],
+    case print_summary(Result) of
+        false ->
+            timer:sleep(100),
+            halt(0);
+        true ->
+            timer:sleep(100),
+            halt(1)
+        end.
+build({{module, Module}, {BeamFile, SrcFile, CompOpts}}, Options) ->
+    BuildResult = maybe_build_erl(Module, BeamFile, SrcFile, CompOpts, Options),
+    {{module, Module}, BuildResult};
+build({{app_file, Target}, Src}, _Options) ->
+    debug("building ~s (always)", [Target]),
+    {ok, [{application, AppName, AppData}]} = file:consult(Src),
+    NewAppData = case proplists:get_value(modules, AppData,
+                                          generate_modules) of
+                     generate_modules ->
+                         SrcDir = filename:dirname(Src),
+                         Modules = [ Module
+                                     || {Module, _} <- modules_to_build(SrcDir)],
+                         [{modules, Modules}
+                          | lists:keydelete(modules, 1, AppData)];
+                     _Modules ->
+                         AppData
+                 end,
+    NewAppData2 = lists:keysort(1, NewAppData),
+    AppTerm = io_lib:format("~p.~n", [{application, AppName, NewAppData2}]),
+    file:write_file(Target,
+                    iolist_to_binary(AppTerm)),
+    {{app_file, Target}, built};
+build({{make, Dir}, []}, _Options) ->
+    {{make, Dir}, run_make(Dir, "all", print)};
+build({{Type, Target}, _TargetOptions}, _Options) ->
+    warn("Unsupported target ~p/~p", [Type, Target]),
+    {{Type, Target}, [{error, [{Target, "Unsupported build target"}]}]}.
+
+clean() ->
+    Options = options(),
+    Targets = targets(Options),    
+    lists:foreach(fun (Target) -> clean(Target) end, Targets).
+
+clean({{module, Module}, {BeamFile, _SrcFile, _CompOpts}}) ->
+    case file:delete(BeamFile) of
+        ok ->
+            format("Cleaned ~s", [Module]);
+        {error, _} ->
+            ok
+    end;
+clean({{app_file, Target}, _Src}) ->
+    case file:delete(Target) of
+        ok ->
+            format("Cleaned ~s", [Target]);
+        {error, _} ->
+            ok
+    end;
+clean({{make, Dir}, _Options}) ->
+    run_make(Dir, "clean", silent);
+clean({{Type, Target}, _}) ->
+    warn("Unsupported target ~p/~p", [Type, Target]).
+
+%%-------------------------------------------------------------------
+%% Work out what we should build
+
+targets(Options) ->
+    case find_src_dirs() of
+        [] ->
+            error("Cannot find any erlang source to build.", []);
+        Dirs ->
+            targets(Dirs, [erl_src, app_files, c_src], Options)
+    end.
+
+targets(Dirs, TargetTypes, Options) ->
+    lists:foldl(fun (Dir, Acc) ->
+                        targets_from_dir(Dir, TargetTypes, Options, Acc)
+                end,
+                [],
+                Dirs).
+
+targets_from_dir(Dir, TargetTypes, Options, Acc) ->
+    lists:foldl(fun (TargetType, DirAcc) ->
+                        target_from_dir(Dir, TargetType, Options, DirAcc)
+                end,
+                Acc,
+                TargetTypes).
+
+target_from_dir(Dir, erl_src, Options, Acc) ->
+    CompileOptions = compile_options(Options),
+    EbinDir = ebin_dir_for(Dir),
+    ToBuild = modules_to_build(Dir),
+    [{{module, Module},
+      {beam(Module, EbinDir), Src,
+       lists:append([ [{outdir, EbinDir}],
+                      [{i, IDir} || IDir <- erl_include_path(Src, Options)],
+                      CompileOptions])}}
+     || {Module, Src} <- ToBuild] ++ Acc;
+target_from_dir(Dir, app_files, Options, Acc) ->
+    case wildcard(Dir, "*.app") of
+        [] -> Acc;
+        AppFiles ->
+            EbinDir = ebin_dir_for(Dir),
+            [{{app_file,
+              filename:join(EbinDir, filename:basename(AppFile))},
+              AppFile}
+             || AppFile <- AppFiles] ++ Acc
+    end;
+target_from_dir(Dir, c_src, Options, Acc) ->
+    ProjDir = filename:dirname(Dir),
+    CSrcDir = filename:join(ProjDir, "c_src"),
+    case filelib:is_dir(CSrcDir) of
+        true ->
+            [{{make, ProjDir}, []} | Acc];
+        false -> Acc
+    end.
+
+beam(Module, EbinDir) ->
+    filename:join(EbinDir, atom_to_list(Module) ++ ".beam").
+
+%%-------------------------------------------------------------------
+%% make commands.
+
+run_make(Dir, Target, Verbosity) ->
+    Port = open_port({spawn_executable, os:find_executable("make")},
+                     [{args, [Target]},
+                      exit_status,
+                      stream,
+                      binary,
+                      {cd, Dir}]),
+    format("Running make ~s in ~s~n", [Target, Dir]),
+    Res = collect_output(Port, Dir, Verbosity),
+    io:format("~n", []),
+    Res.
+
+collect_output(Port, Dir, Verbosity) ->
+    receive
+        {Port, {exit_status, 0}} ->
+            ok;
+        {Port, {exit_status, N}} ->
+            [{error, [{Dir, "Make failed -- " ++ integer_to_list(N)}]}];
+        {Port, {data, Output}} when Verbosity =/= silent->
+            io:format("~s", [Output]),
+            collect_output(Port, Dir, Verbosity);
+        {Port, {data, Output}} when Verbosity =:= silent->
+            collect_output(Port, Dir, Verbosity)
+    end.
+
+%%-------------------------------------------------------------------
+%% Emak option processing.
+
+options() ->
+    emakfile_options() ++ emakrc_options().
+
+compile_options(Options) ->
+    proplists:get_value(compile_options, Options,
+                        [debug_info,
+                         %bin_opt_info,
+                         warn_obsolete_guard]).
+
+emakfile_options() ->
+    consult("Emakfile").
+
+consult("~/" ++ File) ->
+    ExpandedFilename = filename:join(os:getenv("HOME"), File),
+    consult(ExpandedFilename);
+consult(File) ->
+    case filelib:is_file(File) of
+        true ->
+            file:consult(File);
+        false ->
+            []
+    end.
+    
+emakrc_options() ->
+    consult("~/.emak").
+
+%%-------------------------------------------------------------------
+%% Erlang source compilation
+
+maybe_build_erl(Module, BeamFile, SrcFile, CompOpts, _Options) ->
+    case dependencies(SrcFile, CompOpts) of
+        {errors, Errors} -> Errors;
+        {files, Deps} ->
+            case out_of_date(BeamFile, Deps) of
+                up_to_date ->
+                    debug("skipping ~s (uptodate)", [Module]),
+                    up_to_date;
+                Reason ->
+                    format("building ~s (~p)", [Module, Reason]),
+                    build_erl(Module, SrcFile, CompOpts)
+            end
+    end.
+
+build_erl(Module, File, CompilerOptions) ->
+    Options = [return | CompilerOptions],
+    {outdir, OutDir} = lists:keyfind(outdir, 1, Options),
+    case filelib:is_dir(OutDir) of
+        false ->
+            warn("Creating missing ebin dir ~s", [OutDir]),
+            ok = file:make_dir(OutDir);
+        true -> ok
+    end,
+    case compile:file(File, Options) of
+        {ok, Module} ->
+            built;
+        {ok, Module, []} ->
+            built;
+        {ok, Module, Warnings} ->
+            debug("~p warnings: ~p", [Module, Warnings]),
+            [{warning, W} || W <- Warnings];
+        {error, ModErrors, Warnings} ->
+            debug(" ~p errors: ~p", [Module, ModErrors]),
+            [{error, E} || E <- ModErrors] ++
+                [{warning, W} || W <- Warnings]
+    end.
+
+find_src_dirs() ->
+    {ok, Root} = file:get_cwd(),
+    find_src_dirs(Root).
+
+find_src_dirs(Root) ->
+    filelib:fold_files(Root,
+                       ".*\\.erl\$",
+                       true,
+                       fun (File, Acc) ->
+                               SrcDir = filename:dirname(File),
+                               case filename:basename(SrcDir) of
+                                   "src" ->
+                                       case lists:member(SrcDir, Acc) of
+                                           false -> [SrcDir | Acc];
+                                           true -> Acc
+                                       end;
+                                   _ ->
+                                       Acc
+                               end
+                       end,
+                       []).
+
+proj_dir_for(SrcDir) ->
+    filename:dirname(SrcDir).
+
+ebin_dir_for(SrcDir) ->
+    filename:join(proj_dir_for(SrcDir), "ebin").
+
+include_dir_for(SrcDir) ->
+    filename:join(proj_dir_for(SrcDir), "include").
+
+erl_include_path(SrcFile, Options) ->
+    SrcDir = filename:dirname(SrcFile),
+    [proj_dir_for(SrcDir),
+     include_dir_for(SrcDir)].
+
+modules_to_build(SrcDir) ->
+    SrcFiles = wildcard(SrcDir, "*.erl"),
+    [ module_to_build(File)
+      || File <- SrcFiles].
+
+module_to_build(SrcFile) ->
+    {list_to_atom(filename:basename(SrcFile, ".erl")), SrcFile}.
+
+out_of_date(Beam, Deps) ->
+    case filelib:is_file(Beam) of
+        false ->
+            missing;
+        true ->
+            BeamTime = filelib:last_modified(Beam),
+            lists:foldl(fun (File, up_to_date) ->
+                                case BeamTime > filelib:last_modified(File) of
+                                    true -> up_to_date;
+                                    false -> out_of_date
+                                end;
+                            (_File, Acc) -> Acc
+                        end,
+                        up_to_date,
+                        Deps)
+    end.
+
+wildcard(Dir, Pattern) ->
+    filter_backup_files(filelib:wildcard(filename:join(Dir, Pattern))).
+
+filter_backup_files(FileNames) ->
+    [File || File <- FileNames,
+             case filename:basename(File) of
+                ".#" ++ _ -> false;
+                _ -> true
+             end].
+
+%% deps(File, Options) -> {files, FileList} | {errors, Errors}
+dependencies(File, CompilerOptions) ->
+    IncPath = [Dir || {i, Dir} <- CompilerOptions],
+    case epp:parse_file(File, IncPath, []) of
+        {error, Err} ->
+            {errors, [{error, {File, Err}}]};
+        {ok, Forms} ->
+            %% debug("Include path ~p, Forms:~n~p", [IncPath, Forms]),
+            BadIncludes = [ DepFile
+                         || {error,{_LnNumber,epp,{include,file,DepFile}}} <- Forms],
+            case BadIncludes of
+                [] ->
+                    {files,
+                     [ DepFile
+                       || {attribute, _LnNumber, file, {DepFile, _}} <- Forms]};
+                Includes ->
+                    {errors, 
+                     [case filelib:is_file(Include) of
+                          true ->
+                              {error, {Include, ["Unparsable file"]}};
+                          false ->
+                              {error, {Include, ["Missing file"]}}
+                      end
+                      || Include <- Includes]}
+            end
+    end.
+            
+        
+
+%%-------------------------------------------------------------------
+%% Message Printing
+
+debug(Fmt, Args) ->
+    {Fmt, Args},
+    %%io:format(standard_error, "~s| " ++ Fmt ++ "~n", [script_name() | Args]),
+    ok.
+
+format(Fmt, Args) ->
+    %%io:format("~s| " ++ Fmt ++ "~n", [script_name() | Args]),
+    io:format(Fmt ++ "~n", Args),
+    ok.
+
+error(Fmt, Args) ->
+    io:format(standard_error, "~s| " ++ Fmt ++ "~n", [script_name() | Args]),
+    timer:sleep(100),
+    halt(1).
+
+warn(Fmt, Args) ->
+    %%io:format(standard_error, "~s| " ++ Fmt ++ "~n", [script_name() | Args]),
+    io:format(standard_error, Fmt ++ "~n", Args),
+    ok.
+
+script_name() ->
+    filename:basename(escript:script_name()).
+
+print_summary(BuildResult) ->
+    format("~n   *** Build Result ***~n", []),
+    debug("All Data:~n~p", [BuildResult]),
+    
+    %%Builds = [R || R = {{module, _Module}, built} <- BuildResult],
+    %%UpToDate = [R || R = {{module, _Module}, up_to_date} <- BuildResult],
+    %%UpToDateModules = [M || {{module, M}, up_to_date} <- UpToDate], 
+    %% format("Up to date: ~p~n", [UpToDateModules]),
+    %%Built = [Module || {{module, Module}, built} <- Builds],
+
+    print_successes(BuildResult),
+    format("", []),
+    %%format("Successfully built modules ~p~n", [Built]),
+    %%NonBuilds = BuildResult -- Builds -- UpToDate,
+    ErrorRes = [R || R = {_Target, Errors} <- BuildResult,
+                     is_list(Errors)],
+    ErrorData = flatten_errors(ErrorRes),
+    debug("Error Data:~n~p", [ErrorData]),
+    HasErrors = lists:keyfind(error, 3, ErrorData) =/= false,
+    print_file_problems(ErrorData, error),
+    print_file_problems(ErrorData, warning),
+    HasErrors.
+
+print_successes(BuildResult) ->
+    S = lists:foldl(fun ({{Type, Target}, Result}, D) when is_atom(Result) ->
+                            dict:append_list({Type, Result}, [Target], D);
+                        (_, D) -> D
+                    end,
+                    dict:new(),
+                    BuildResult),
+    dict:map(fun ({module, up_to_date}, Targets) ->
+                     format("Up to date modules: ~p", [Targets]);
+                 ({module, built}, Targets) ->
+                     format("Successfully built modules: ~p", [Targets]);
+                 ({app_file, built}, Targets) ->
+                     format("Built app files: ~p", [Targets]);
+                 ({make, ok}, Targets) ->
+                     format("Made all successfully in: ~p", [Targets]);
+                 ({Type, Result}, Targets) ->
+                     format("~p ~p for targets: ~p", [Type, Result, Targets])
+             end,
+             S).
+
+print_file_problems(Errors, Type) ->
+    Files = lists:usort([EFile
+                         || {_EMod, EFile, EType, _FError} <- Errors,
+                            EType =:= Type]),
+    lists:foldl(fun (File, Acc) ->
+                        print_file_problem(File, Errors, Type, Acc)
+                end,
+                [],
+                Files).
+
+print_file_problem(File, Errors, Type, Acc) ->
+    case lists:member(File, Acc) of
+        false ->
+            FileErrors = lists:usort([FError
+                                      || {_EMod, EFile, EType, FError} <- Errors,
+                                         EFile =:= File,
+                                         EType =:= Type]),
+            ModulesAffected = lists:usort([EMod
+                                           || {{module, EMod}, EFile, EType, _FError}
+                                                  <- Errors,
+                                              EFile =:= File,
+                                              EType =:= Type]),
+            debug("~s Problems: ~p", [File, FileErrors]),
+            debug("~s Modules Affected: ~p", [File, ModulesAffected]),
+            case Type of
+                error ->
+                    format("Errors in ~s prevented compilation of modules ~p:",
+                           [File, ModulesAffected]);
+                warning ->
+                    format("Warnings in ~s:", [File])
+            end,
+            lists:foldl(fun (Err = {Line, Module, Error}, Reported) ->
+                                case lists:member(Err, Reported) of
+                                    false ->
+                                        format("~s:~p -- ~s",
+                                               [File, Line, Module:format_error(Error)]),
+                                        [Err | Reported];
+                                    true ->
+                                        Reported
+                                end;
+                            (String, Reported) ->
+                                case lists:member({File, String}, Reported) of
+                                    false ->
+                                        format("~s: -- ~s", [File, String]),
+                                        [{File, String} | Reported];
+                                    true ->
+                                        Reported
+                                end
+                        end,
+                        [],
+                        FileErrors),
+            io:format("~n", []),
+            [File | Acc];
+        true ->
+            Acc
+    end.
+
+flatten_errors(ErrorRes) ->
+    lists:flatten([ [ [ {Target, File, Type, FError}
+                        || FError <- FErrors]
+                      || {Type, {File, FErrors}} <- Errors]
+                    || {Target, Errors} <- ErrorRes]).
+
+%% [{Target, Result}]
+%% Result = built | up_to_date | [Report]
+%% Report = {error, {File, Report}} | {warning, {File, Report}}
