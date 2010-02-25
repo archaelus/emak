@@ -27,18 +27,18 @@ Use
 Common Targets
 ______________
 
-emak clean:
+emak clean
     Cleans compiled modules, app files and run 'make clean' anywhere
     it can find c_src.
 
-emak [all]:
+emak [all]
     Compiles all modules, app files and runs 'make all' anywhere it
     can find c_src.
 
 Unusual Targets
 _______________
 
-emak what:
+emak what
     Lists all targets
 
 emak erl_src <src/[path/]file.erl>
