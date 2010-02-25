@@ -172,7 +172,7 @@ target_from_dir(Dir, erl_src, Options, Acc) ->
                       [{i, IDir} || IDir <- erl_include_path(Src, Options)],
                       CompileOptions])}}
      || {Module, Src} <- ToBuild] ++ Acc;
-target_from_dir(Dir, app_files, Options, Acc) ->
+target_from_dir(Dir, app_files, _XXXOptions, Acc) ->
     case wildcard(Dir, "*.app") of
         [] -> Acc;
         AppFiles ->
@@ -182,7 +182,7 @@ target_from_dir(Dir, app_files, Options, Acc) ->
               AppFile}
              || AppFile <- AppFiles] ++ Acc
     end;
-target_from_dir(Dir, c_src, Options, Acc) ->
+target_from_dir(Dir, c_src, _XXXOptions, Acc) ->
     ProjDir = filename:dirname(Dir),
     CSrcDir = filename:join(ProjDir, "c_src"),
     case filelib:is_dir(CSrcDir) of
@@ -218,7 +218,7 @@ collect_output(Port, Dir, Verbosity) ->
         {Port, {data, Output}} when Verbosity =/= silent->
             io:format("~s", [Output]),
             collect_output(Port, Dir, Verbosity);
-        {Port, {data, Output}} when Verbosity =:= silent->
+        {Port, {data, _Output}} when Verbosity =:= silent->
             collect_output(Port, Dir, Verbosity)
     end.
 
@@ -322,7 +322,7 @@ ebin_dir_for(SrcDir) ->
 include_dir_for(SrcDir) ->
     filename:join(proj_dir_for(SrcDir), "include").
 
-erl_include_path(SrcFile, Options) ->
+erl_include_path(SrcFile, _XXXOptions) ->
     SrcDir = filename:dirname(SrcFile),
     [proj_dir_for(SrcDir),
      include_dir_for(SrcDir)].
