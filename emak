@@ -62,10 +62,12 @@ main(["erl_src", Src]) ->
     Options = options(),
     CompileOptions = compile_options(Options),
     EbinDir = ebin_dir_for(filename:dirname(Src)),
-    Target = {module, Module, beam(Module, EbinDir), Src,
-              lists:append([ [{outdir, EbinDir}],
-                             [{i, IDir} || IDir <- erl_include_path(Src, Options)],
-                             CompileOptions])},
+    Target = {{module, Module},
+              {beam(Module, EbinDir),
+               Src,
+               lists:append([ [{outdir, EbinDir}],
+                              [{i, IDir} || IDir <- erl_include_path(Src, Options)],
+                              CompileOptions])}},
     print_summary([build(Target, Options)]);
 main(_) ->
     io:format("usage: ~s [clean | all | erl_src <file>]~n", [script_name()]),
