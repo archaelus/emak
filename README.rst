@@ -5,6 +5,18 @@ Emak - erl -make, only more so.
 Emak is a make tool for erlang projects written in erlang (well,
 escript).
 
+Currently emak will compile simple(ish) erlang projects
+automagically. It fails (at a minimum) on parse_transforms as it
+doesn't yet construct a dependency graph for all targets.
+
+Future plans:
+* Parallel builds
+* Handling of parse_transforms
+* Better dependency tracking
+* OTP Release support
+* Running Eunit test suites
+* erl_tidy(ing) source code
+
 Requirements
 ============
 
