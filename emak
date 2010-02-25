@@ -370,6 +370,12 @@ dependencies(File, CompilerOptions) ->
             {errors, [{error, {File, Err}}]};
         {ok, Forms} ->
             %% debug("Include path ~p, Forms:~n~p", [IncPath, Forms]),
+            case [PTModule
+                  || {attribute, _LnNumber, compile, {parse_transform, PTModule}} <- Forms] of
+                [] -> ok;
+                Modules ->
+                    format("TODO: We should compile the parse_transform modules ~p first.", [Modules])
+            end,
             BadIncludes = [ DepFile
                          || {error,{_LnNumber,epp,{include,file,DepFile}}} <- Forms],
             case BadIncludes of
